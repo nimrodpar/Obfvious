@@ -1,0 +1,943 @@
+//===--- APValue.cpp - Union class for APFloat/APSInt/Complex -------------===//
+//
+// Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
+// See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+//
+//  This file implements the APValue class.
+//
+//===----------------------------------------------------------------------===//
+
+#include "clang/AST/APValue.h"
+#include "clang/AST/ASTContext.h"
+#include "clang/AST/CharUnits.h"
+#include "clang/AST/DeclCXX.h"
+#include "clang/AST/Expr.h"
+#include "clang/AST/Type.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
+using namespace clang;
+
+/// The identity of a type_info object depends on the canonical unqualified
+/// type only.
+TypeInfoLValue::TypeInfoLValue(const Type *T)
+    : T(T->getCanonicalTypeUnqualified().getTypePtr()) {}
+
+void TypeInfoLValue::print(llvm::raw_ostream &Out,
+                           const PrintingPolicy &Policy) const {
+  Out << "typeid(";
+  QualType(getType(), 0).print(Out, Policy);
+  Out << ")";
+}
+
+static_assert(
+    1 << llvm::PointerLikeTypeTraits<TypeInfoLValue>::NumLowBitsAvailable <=
+        alignof(Type),
+    "Type is insufficiently aligned");
+
+APValue::LValueBase::LValueBase(const ValueDecl *P, unsigned I, unsigned V)
+    : Ptr(P ? cast<ValueDecl>(P->getCanonicalDecl()) : nullptr), Local{I, V} {}
+APValue::LValueBase::LValueBase(const Expr *P, unsigned I, unsigned V)
+    : Ptr(P), Local{I, V} {}
+
+APValue::LValueBase APValue::LValueBase::getDynamicAlloc(DynamicAllocLValue LV,
+                                                         QualType Type) {
+  LValueBase Base;
+  Base.Ptr = LV;
+  Base.DynamicAllocType = Type.getAsOpaquePtr();
+  return Base;
+}
+
+APValue::LValueBase APValue::LValueBase::getTypeInfo(TypeInfoLValue LV,
+                                                     QualType TypeInfo) {
+  LValueBase Base;
+  Base.Ptr = LV;
+  Base.TypeInfoType = TypeInfo.getAsOpaquePtr();
+  return Base;
+}
+
+unsigned APValue::LValueBase::getCallIndex() const {
+  return (is<TypeInfoLValue>() || is<DynamicAllocLValue>()) ? 0
+                                                            : Local.CallIndex;
+}
+
+unsigned APValue::LValueBase::getVersion() const {
+  return (is<TypeInfoLValue>() || is<DynamicAllocLValue>()) ? 0 : Local.Version;
+}
+
+QualType APValue::LValueBase::getTypeInfoType() const {
+  assert(is<TypeInfoLValue>() && "not a type_info lvalue");
+  return QualType::getFromOpaquePtr(TypeInfoType);
+}
+
+QualType APValue::LValueBase::getDynamicAllocType() const {
+  assert(is<DynamicAllocLValue>() && "not a dynamic allocation lvalue");
+  return QualType::getFromOpaquePtr(DynamicAllocType);
+}
+
+void APValue::LValueBase::profile(llvm::FoldingSetNodeID &ID) const {
+  ID.AddPointer(Ptr.getOpaqueValue());
+  if (is<TypeInfoLValue>() || is<DynamicAllocLValue>())
+    return;
+  ID.AddInteger(Local.CallIndex);
+  ID.AddInteger(Local.Version);
+}
+
+namespace clang {
+bool operator==(const APValue::LValueBase &LHS,
+                const APValue::LValueBase &RHS) {
+  if (LHS.Ptr != RHS.Ptr)
+    return false;
+  if (LHS.is<TypeInfoLValue>() || LHS.is<DynamicAllocLValue>())
+    return true;
+  return LHS.Local.CallIndex == RHS.Local.CallIndex &&
+         LHS.Local.Version == RHS.Local.Version;
+}
+}
+
+APValue::LValuePathEntry::LValuePathEntry(BaseOrMemberType BaseOrMember) {
+  if (const Decl *D = BaseOrMember.getPointer())
+    BaseOrMember.setPointer(D->getCanonicalDecl());
+  Value = reinterpret_cast<uintptr_t>(BaseOrMember.getOpaqueValue());
+}
+
+void APValue::LValuePathEntry::profile(llvm::FoldingSetNodeID &ID) const {
+  ID.AddInteger(Value);
+}
+
+namespace {
+  struct LVBase {
+    APValue::LValueBase Base;
+    CharUnits Offset;
+    unsigned PathLength;
+    bool IsNullPtr : 1;
+    bool IsOnePastTheEnd : 1;
+  };
+}
+
+void *APValue::LValueBase::getOpaqueValue() const {
+  return Ptr.getOpaqueValue();
+}
+
+bool APValue::LValueBase::isNull() const {
+  return Ptr.isNull();
+}
+
+APValue::LValueBase::operator bool () const {
+  return static_cast<bool>(Ptr);
+}
+
+clang::APValue::LValueBase
+llvm::DenseMapInfo<clang::APValue::LValueBase>::getEmptyKey() {
+  clang::APValue::LValueBase B;
+  B.Ptr = DenseMapInfo<const ValueDecl*>::getEmptyKey();
+  return B;
+}
+
+clang::APValue::LValueBase
+llvm::DenseMapInfo<clang::APValue::LValueBase>::getTombstoneKey() {
+  clang::APValue::LValueBase B;
+  B.Ptr = DenseMapInfo<const ValueDecl*>::getTombstoneKey();
+  return B;
+}
+
+namespace clang {
+llvm::hash_code hash_value(const APValue::LValueBase &Base) {
+  if (Base.is<TypeInfoLValue>() || Base.is<DynamicAllocLValue>())
+    return llvm::hash_value(Base.getOpaqueValue());
+  return llvm::hash_combine(Base.getOpaqueValue(), Base.getCallIndex(),
+                            Base.getVersion());
+}
+}
+
+unsigned llvm::DenseMapInfo<clang::APValue::LValueBase>::getHashValue(
+    const clang::APValue::LValueBase &Base) {
+  return hash_value(Base);
+}
+
+bool llvm::DenseMapInfo<clang::APValue::LValueBase>::isEqual(
+    const clang::APValue::LValueBase &LHS,
+    const clang::APValue::LValueBase &RHS) {
+  return LHS == RHS;
+}
+
+struct APValue::LV : LVBase {
+  static const unsigned InlinePathSpace =
+      (DataSize - sizeof(LVBase)) / sizeof(LValuePathEntry);
+
+  /// Path - The sequence of base classes, fields and array indices to follow to
+  /// walk from Base to the subobject. When performing GCC-style folding, there
+  /// may not be such a path.
+  union {
+    LValuePathEntry Path[InlinePathSpace];
+    LValuePathEntry *PathPtr;
+  };
+
+  LV() { PathLength = (unsigned)-1; }
+  ~LV() { resizePath(0); }
+
+  void resizePath(unsigned Length) {
+    if (Length == PathLength)
+      return;
+    if (hasPathPtr())
+      delete [] PathPtr;
+    PathLength = Length;
+    if (hasPathPtr())
+      PathPtr = new LValuePathEntry[Length];
+  }
+
+  bool hasPath() const { return PathLength != (unsigned)-1; }
+  bool hasPathPtr() const { return hasPath() && PathLength > InlinePathSpace; }
+
+  LValuePathEntry *getPath() { return hasPathPtr() ? PathPtr : Path; }
+  const LValuePathEntry *getPath() const {
+    return hasPathPtr() ? PathPtr : Path;
+  }
+};
+
+namespace {
+  struct MemberPointerBase {
+    llvm::PointerIntPair<const ValueDecl*, 1, bool> MemberAndIsDerivedMember;
+    unsigned PathLength;
+  };
+}
+
+struct APValue::MemberPointerData : MemberPointerBase {
+  static const unsigned InlinePathSpace =
+      (DataSize - sizeof(MemberPointerBase)) / sizeof(const CXXRecordDecl*);
+  typedef const CXXRecordDecl *PathElem;
+  union {
+    PathElem Path[InlinePathSpace];
+    PathElem *PathPtr;
+  };
+
+  MemberPointerData() { PathLength = 0; }
+  ~MemberPointerData() { resizePath(0); }
+
+  void resizePath(unsigned Length) {
+    if (Length == PathLength)
+      return;
+    if (hasPathPtr())
+      delete [] PathPtr;
+    PathLength = Length;
+    if (hasPathPtr())
+      PathPtr = new PathElem[Length];
+  }
+
+  bool hasPathPtr() const { return PathLength > InlinePathSpace; }
+
+  PathElem *getPath() { return hasPathPtr() ? PathPtr : Path; }
+  const PathElem *getPath() const {
+    return hasPathPtr() ? PathPtr : Path;
+  }
+};
+
+// FIXME: Reduce the malloc traffic here.
+
+APValue::Arr::Arr(unsigned NumElts, unsigned Size) :
+  Elts(new APValue[NumElts + (NumElts != Size ? 1 : 0)]),
+  NumElts(NumElts), ArrSize(Size) {}
+APValue::Arr::~Arr() { delete [] Elts; }
+
+APValue::StructData::StructData(unsigned NumBases, unsigned NumFields) :
+  Elts(new APValue[NumBases+NumFields]),
+  NumBases(NumBases), NumFields(NumFields) {}
+APValue::StructData::~StructData() {
+  delete [] Elts;
+}
+
+APValue::UnionData::UnionData() : Field(nullptr), Value(new APValue) {}
+APValue::UnionData::~UnionData () {
+  delete Value;
+}
+
+APValue::APValue(const APValue &RHS) : Kind(None) {
+  switch (RHS.getKind()) {
+  case None:
+  case Indeterminate:
+    Kind = RHS.getKind();
+    break;
+  case Int:
+    MakeInt();
+    setInt(RHS.getInt());
+    break;
+  case Float:
+    MakeFloat();
+    setFloat(RHS.getFloat());
+    break;
+  case FixedPoint: {
+    APFixedPoint FXCopy = RHS.getFixedPoint();
+    MakeFixedPoint(std::move(FXCopy));
+    break;
+  }
+  case Vector:
+    MakeVector();
+    setVector(((const Vec *)(const char *)RHS.Data.buffer)->Elts,
+              RHS.getVectorLength());
+    break;
+  case ComplexInt:
+    MakeComplexInt();
+    setComplexInt(RHS.getComplexIntReal(), RHS.getComplexIntImag());
+    break;
+  case ComplexFloat:
+    MakeComplexFloat();
+    setComplexFloat(RHS.getComplexFloatReal(), RHS.getComplexFloatImag());
+    break;
+  case LValue:
+    MakeLValue();
+    if (RHS.hasLValuePath())
+      setLValue(RHS.getLValueBase(), RHS.getLValueOffset(), RHS.getLValuePath(),
+                RHS.isLValueOnePastTheEnd(), RHS.isNullPointer());
+    else
+      setLValue(RHS.getLValueBase(), RHS.getLValueOffset(), NoLValuePath(),
+                RHS.isNullPointer());
+    break;
+  case Array:
+    MakeArray(RHS.getArrayInitializedElts(), RHS.getArraySize());
+    for (unsigned I = 0, N = RHS.getArrayInitializedElts(); I != N; ++I)
+      getArrayInitializedElt(I) = RHS.getArrayInitializedElt(I);
+    if (RHS.hasArrayFiller())
+      getArrayFiller() = RHS.getArrayFiller();
+    break;
+  case Struct:
+    MakeStruct(RHS.getStructNumBases(), RHS.getStructNumFields());
+    for (unsigned I = 0, N = RHS.getStructNumBases(); I != N; ++I)
+      getStructBase(I) = RHS.getStructBase(I);
+    for (unsigned I = 0, N = RHS.getStructNumFields(); I != N; ++I)
+      getStructField(I) = RHS.getStructField(I);
+    break;
+  case Union:
+    MakeUnion();
+    setUnion(RHS.getUnionField(), RHS.getUnionValue());
+    break;
+  case MemberPointer:
+    MakeMemberPointer(RHS.getMemberPointerDecl(),
+                      RHS.isMemberPointerToDerivedMember(),
+                      RHS.getMemberPointerPath());
+    break;
+  case AddrLabelDiff:
+    MakeAddrLabelDiff();
+    setAddrLabelDiff(RHS.getAddrLabelDiffLHS(), RHS.getAddrLabelDiffRHS());
+    break;
+  }
+}
+
+APValue::APValue(APValue &&RHS) : Kind(RHS.Kind), Data(RHS.Data) {
+  RHS.Kind = None;
+}
+
+APValue &APValue::operator=(const APValue &RHS) {
+  if (this != &RHS)
+    *this = APValue(RHS);
+  return *this;
+}
+
+APValue &APValue::operator=(APValue &&RHS) {
+  if (Kind != None && Kind != Indeterminate)
+    DestroyDataAndMakeUninit();
+  Kind = RHS.Kind;
+  Data = RHS.Data;
+  RHS.Kind = None;
+  return *this;
+}
+
+void APValue::DestroyDataAndMakeUninit() {
+  if (Kind == Int)
+    ((APSInt*)(char*)Data.buffer)->~APSInt();
+  else if (Kind == Float)
+    ((APFloat*)(char*)Data.buffer)->~APFloat();
+  else if (Kind == FixedPoint)
+    ((APFixedPoint *)(char *)Data.buffer)->~APFixedPoint();
+  else if (Kind == Vector)
+    ((Vec*)(char*)Data.buffer)->~Vec();
+  else if (Kind == ComplexInt)
+    ((ComplexAPSInt*)(char*)Data.buffer)->~ComplexAPSInt();
+  else if (Kind == ComplexFloat)
+    ((ComplexAPFloat*)(char*)Data.buffer)->~ComplexAPFloat();
+  else if (Kind == LValue)
+    ((LV*)(char*)Data.buffer)->~LV();
+  else if (Kind == Array)
+    ((Arr*)(char*)Data.buffer)->~Arr();
+  else if (Kind == Struct)
+    ((StructData*)(char*)Data.buffer)->~StructData();
+  else if (Kind == Union)
+    ((UnionData*)(char*)Data.buffer)->~UnionData();
+  else if (Kind == MemberPointer)
+    ((MemberPointerData*)(char*)Data.buffer)->~MemberPointerData();
+  else if (Kind == AddrLabelDiff)
+    ((AddrLabelDiffData*)(char*)Data.buffer)->~AddrLabelDiffData();
+  Kind = None;
+}
+
+bool APValue::needsCleanup() const {
+  switch (getKind()) {
+  case None:
+  case Indeterminate:
+  case AddrLabelDiff:
+    return false;
+  case Struct:
+  case Union:
+  case Array:
+  case Vector:
+    return true;
+  case Int:
+    return getInt().needsCleanup();
+  case Float:
+    return getFloat().needsCleanup();
+  case FixedPoint:
+    return getFixedPoint().getValue().needsCleanup();
+  case ComplexFloat:
+    assert(getComplexFloatImag().needsCleanup() ==
+               getComplexFloatReal().needsCleanup() &&
+           "In _Complex float types, real and imaginary values always have the "
+           "same size.");
+    return getComplexFloatReal().needsCleanup();
+  case ComplexInt:
+    assert(getComplexIntImag().needsCleanup() ==
+               getComplexIntReal().needsCleanup() &&
+           "In _Complex int types, real and imaginary values must have the "
+           "same size.");
+    return getComplexIntReal().needsCleanup();
+  case LValue:
+    return reinterpret_cast<const LV *>(Data.buffer)->hasPathPtr();
+  case MemberPointer:
+    return reinterpret_cast<const MemberPointerData *>(Data.buffer)
+        ->hasPathPtr();
+  }
+  llvm_unreachable("Unknown APValue kind!");
+}
+
+void APValue::swap(APValue &RHS) {
+  std::swap(Kind, RHS.Kind);
+  std::swap(Data, RHS.Data);
+}
+
+void APValue::profile(llvm::FoldingSetNodeID &ID) const {
+  ID.AddInteger(Kind);
+
+  switch (Kind) {
+  case None:
+  case Indeterminate:
+    return;
+
+  case AddrLabelDiff:
+    ID.AddPointer(getAddrLabelDiffLHS()->getLabel()->getCanonicalDecl());
+    ID.AddPointer(getAddrLabelDiffRHS()->getLabel()->getCanonicalDecl());
+    return;
+
+  case Struct:
+    ID.AddInteger(getStructNumBases());
+    for (unsigned I = 0, N = getStructNumBases(); I != N; ++I)
+      getStructBase(I).profile(ID);
+    ID.AddInteger(getStructNumFields());
+    for (unsigned I = 0, N = getStructNumFields(); I != N; ++I)
+      getStructField(I).profile(ID);
+    return;
+
+  case Union:
+    if (!getUnionField()) {
+      ID.AddPointer(nullptr);
+      return;
+    }
+    ID.AddPointer(getUnionField()->getCanonicalDecl());
+    getUnionValue().profile(ID);
+    return;
+
+  case Array: {
+    ID.AddInteger(getArraySize());
+    if (getArraySize() == 0)
+      return;
+
+    // The profile should not depend on whether the array is expanded or
+    // not, but we don't want to profile the array filler many times for
+    // a large array. So treat all equal trailing elements as the filler.
+    // Elements are profiled in reverse order to support this, and the
+    // first profiled element is followed by a count. For example:
+    //
+    //   ['a', 'c', 'x', 'x', 'x'] is profiled as
+    //   [5, 'x', 3, 'c', 'a']
+    llvm::FoldingSetNodeID FillerID;
+    (hasArrayFiller() ? getArrayFiller() :
+     getArrayInitializedElt(getArrayInitializedElts() -
+       1)).profile(FillerID);
+    ID.AddNodeID(FillerID);
+    unsigned NumFillers = getArraySize() - getArrayInitializedElts();
+    unsigned N = getArrayInitializedElts();
+
+    // Count the number of elements equal to the last one. This loop ends
+    // by adding an integer indicating the number of such elements, with
+    // N set to the number of elements left to profile.
+    while (true) {
+      if (N == 0) {
+        // All elements are fillers.
+        assert(NumFillers == getArraySize());
+        ID.AddInteger(NumFillers);
+        break;
+      }
+
+      // No need to check if the last element is equal to the last
+      // element.
+      if (N != getArraySize()) {
+        llvm::FoldingSetNodeID ElemID;
+        getArrayInitializedElt(N - 1).profile(ElemID);
+        if (ElemID != FillerID) {
+          ID.AddInteger(NumFillers);
+          ID.AddNodeID(ElemID);
+          --N;
+          break;
+        }
+      }
+
+      // This is a filler.
+      ++NumFillers;
+      --N;
+    }
+
+    // Emit the remaining elements.
+    for (; N != 0; --N)
+      getArrayInitializedElt(N - 1).profile(ID);
+    return;
+  }
+
+  case Vector:
+    ID.AddInteger(getVectorLength());
+    for (unsigned I = 0, N = getVectorLength(); I != N; ++I)
+      getVectorElt(I).profile(ID);
+    return;
+
+  case Int:
+    // We don't need to include the sign bit; it's implied by the type.
+    getInt().APInt::Profile(ID);
+    return;
+
+  case Float:
+    getFloat().Profile(ID);
+    return;
+
+  case FixedPoint:
+    // We don't need to include the fixed-point semantics; they're
+    // implied by the type.
+    getFixedPoint().getValue().APInt::Profile(ID);
+    return;
+
+  case ComplexFloat:
+    getComplexFloatReal().Profile(ID);
+    getComplexFloatImag().Profile(ID);
+    return;
+
+  case ComplexInt:
+    getComplexIntReal().APInt::Profile(ID);
+    getComplexIntImag().APInt::Profile(ID);
+    return;
+
+  case LValue:
+    getLValueBase().profile(ID);
+    ID.AddInteger(getLValueOffset().getQuantity());
+    ID.AddInteger(isNullPointer());
+    ID.AddInteger(isLValueOnePastTheEnd());
+    // For uniqueness, we only need to profile the entries corresponding
+    // to union members, but we don't have the type here so we don't know
+    // how to interpret the entries.
+    for (LValuePathEntry E : getLValuePath())
+      E.profile(ID);
+    return;
+
+  case MemberPointer:
+    ID.AddPointer(getMemberPointerDecl());
+    ID.AddInteger(isMemberPointerToDerivedMember());
+    for (const CXXRecordDecl *D : getMemberPointerPath())
+      ID.AddPointer(D);
+    return;
+  }
+
+  llvm_unreachable("Unknown APValue kind!");
+}
+
+static double GetApproxValue(const llvm::APFloat &F) {
+  llvm::APFloat V = F;
+  bool ignored;
+  V.convert(llvm::APFloat::IEEEdouble(), llvm::APFloat::rmNearestTiesToEven,
+            &ignored);
+  return V.convertToDouble();
+}
+
+void APValue::printPretty(raw_ostream &Out, const ASTContext &Ctx,
+                          QualType Ty) const {
+  // There are no objects of type 'void', but values of this type can be
+  // returned from functions.
+  if (Ty->isVoidType()) {
+    Out << "void()";
+    return;
+  }
+
+  switch (getKind()) {
+  case APValue::None:
+    Out << "<out of lifetime>";
+    return;
+  case APValue::Indeterminate:
+    Out << "<uninitialized>";
+    return;
+  case APValue::Int:
+    if (Ty->isBooleanType())
+      Out << (getInt().getBoolValue() ? "true" : "false");
+    else
+      Out << getInt();
+    return;
+  case APValue::Float:
+    Out << GetApproxValue(getFloat());
+    return;
+  case APValue::FixedPoint:
+    Out << getFixedPoint();
+    return;
+  case APValue::Vector: {
+    Out << '{';
+    QualType ElemTy = Ty->castAs<VectorType>()->getElementType();
+    getVectorElt(0).printPretty(Out, Ctx, ElemTy);
+    for (unsigned i = 1; i != getVectorLength(); ++i) {
+      Out << ", ";
+      getVectorElt(i).printPretty(Out, Ctx, ElemTy);
+    }
+    Out << '}';
+    return;
+  }
+  case APValue::ComplexInt:
+    Out << getComplexIntReal() << "+" << getComplexIntImag() << "i";
+    return;
+  case APValue::ComplexFloat:
+    Out << GetApproxValue(getComplexFloatReal()) << "+"
+        << GetApproxValue(getComplexFloatImag()) << "i";
+    return;
+  case APValue::LValue: {
+    bool IsReference = Ty->isReferenceType();
+    QualType InnerTy
+      = IsReference ? Ty.getNonReferenceType() : Ty->getPointeeType();
+    if (InnerTy.isNull())
+      InnerTy = Ty;
+
+    LValueBase Base = getLValueBase();
+    if (!Base) {
+      if (isNullPointer()) {
+        Out << (Ctx.getLangOpts().CPlusPlus11 ? "nullptr" : "0");
+      } else if (IsReference) {
+        Out << "*(" << InnerTy.stream(Ctx.getPrintingPolicy()) << "*)"
+            << getLValueOffset().getQuantity();
+      } else {
+        Out << "(" << Ty.stream(Ctx.getPrintingPolicy()) << ")"
+            << getLValueOffset().getQuantity();
+      }
+      return;
+    }
+
+    if (!hasLValuePath()) {
+      // No lvalue path: just print the offset.
+      CharUnits O = getLValueOffset();
+      CharUnits S = Ctx.getTypeSizeInChars(InnerTy);
+      if (!O.isZero()) {
+        if (IsReference)
+          Out << "*(";
+        if (O % S) {
+          Out << "(char*)";
+          S = CharUnits::One();
+        }
+        Out << '&';
+      } else if (!IsReference) {
+        Out << '&';
+      }
+
+      if (const ValueDecl *VD = Base.dyn_cast<const ValueDecl*>())
+        Out << *VD;
+      else if (TypeInfoLValue TI = Base.dyn_cast<TypeInfoLValue>()) {
+        TI.print(Out, Ctx.getPrintingPolicy());
+      } else if (DynamicAllocLValue DA = Base.dyn_cast<DynamicAllocLValue>()) {
+        Out << "{*new "
+            << Base.getDynamicAllocType().stream(Ctx.getPrintingPolicy()) << "#"
+            << DA.getIndex() << "}";
+      } else {
+        assert(Base.get<const Expr *>() != nullptr &&
+               "Expecting non-null Expr");
+        Base.get<const Expr*>()->printPretty(Out, nullptr,
+                                             Ctx.getPrintingPolicy());
+      }
+
+      if (!O.isZero()) {
+        Out << " + " << (O / S);
+        if (IsReference)
+          Out << ')';
+      }
+      return;
+    }
+
+    // We have an lvalue path. Print it out nicely.
+    if (!IsReference)
+      Out << '&';
+    else if (isLValueOnePastTheEnd())
+      Out << "*(&";
+
+    QualType ElemTy;
+    if (const ValueDecl *VD = Base.dyn_cast<const ValueDecl*>()) {
+      Out << *VD;
+      ElemTy = VD->getType();
+    } else if (TypeInfoLValue TI = Base.dyn_cast<TypeInfoLValue>()) {
+      TI.print(Out, Ctx.getPrintingPolicy());
+      ElemTy = Base.getTypeInfoType();
+    } else if (DynamicAllocLValue DA = Base.dyn_cast<DynamicAllocLValue>()) {
+      Out << "{*new "
+          << Base.getDynamicAllocType().stream(Ctx.getPrintingPolicy()) << "#"
+          << DA.getIndex() << "}";
+      ElemTy = Base.getDynamicAllocType();
+    } else {
+      const Expr *E = Base.get<const Expr*>();
+      assert(E != nullptr && "Expecting non-null Expr");
+      E->printPretty(Out, nullptr, Ctx.getPrintingPolicy());
+      // FIXME: This is wrong if E is a MaterializeTemporaryExpr with an lvalue
+      // adjustment.
+      ElemTy = E->getType();
+    }
+
+    ArrayRef<LValuePathEntry> Path = getLValuePath();
+    const CXXRecordDecl *CastToBase = nullptr;
+    for (unsigned I = 0, N = Path.size(); I != N; ++I) {
+      if (ElemTy->getAs<RecordType>()) {
+        // The lvalue refers to a class type, so the next path entry is a base
+        // or member.
+        const Decl *BaseOrMember = Path[I].getAsBaseOrMember().getPointer();
+        if (const CXXRecordDecl *RD = dyn_cast<CXXRecordDecl>(BaseOrMember)) {
+          CastToBase = RD;
+          ElemTy = Ctx.getRecordType(RD);
+        } else {
+          const ValueDecl *VD = cast<ValueDecl>(BaseOrMember);
+          Out << ".";
+          if (CastToBase)
+            Out << *CastToBase << "::";
+          Out << *VD;
+          ElemTy = VD->getType();
+        }
+      } else {
+        // The lvalue must refer to an array.
+        Out << '[' << Path[I].getAsArrayIndex() << ']';
+        ElemTy = Ctx.getAsArrayType(ElemTy)->getElementType();
+      }
+    }
+
+    // Handle formatting of one-past-the-end lvalues.
+    if (isLValueOnePastTheEnd()) {
+      // FIXME: If CastToBase is non-0, we should prefix the output with
+      // "(CastToBase*)".
+      Out << " + 1";
+      if (IsReference)
+        Out << ')';
+    }
+    return;
+  }
+  case APValue::Array: {
+    const ArrayType *AT = Ctx.getAsArrayType(Ty);
+    QualType ElemTy = AT->getElementType();
+    Out << '{';
+    if (unsigned N = getArrayInitializedElts()) {
+      getArrayInitializedElt(0).printPretty(Out, Ctx, ElemTy);
+      for (unsigned I = 1; I != N; ++I) {
+        Out << ", ";
+        if (I == 10) {
+          // Avoid printing out the entire contents of large arrays.
+          Out << "...";
+          break;
+        }
+        getArrayInitializedElt(I).printPretty(Out, Ctx, ElemTy);
+      }
+    }
+    Out << '}';
+    return;
+  }
+  case APValue::Struct: {
+    Out << '{';
+    const RecordDecl *RD = Ty->castAs<RecordType>()->getDecl();
+    bool First = true;
+    if (unsigned N = getStructNumBases()) {
+      const CXXRecordDecl *CD = cast<CXXRecordDecl>(RD);
+      CXXRecordDecl::base_class_const_iterator BI = CD->bases_begin();
+      for (unsigned I = 0; I != N; ++I, ++BI) {
+        assert(BI != CD->bases_end());
+        if (!First)
+          Out << ", ";
+        getStructBase(I).printPretty(Out, Ctx, BI->getType());
+        First = false;
+      }
+    }
+    for (const auto *FI : RD->fields()) {
+      if (!First)
+        Out << ", ";
+      if (FI->isUnnamedBitfield()) continue;
+      getStructField(FI->getFieldIndex()).
+        printPretty(Out, Ctx, FI->getType());
+      First = false;
+    }
+    Out << '}';
+    return;
+  }
+  case APValue::Union:
+    Out << '{';
+    if (const FieldDecl *FD = getUnionField()) {
+      Out << "." << *FD << " = ";
+      getUnionValue().printPretty(Out, Ctx, FD->getType());
+    }
+    Out << '}';
+    return;
+  case APValue::MemberPointer:
+    // FIXME: This is not enough to unambiguously identify the member in a
+    // multiple-inheritance scenario.
+    if (const ValueDecl *VD = getMemberPointerDecl()) {
+      Out << '&' << *cast<CXXRecordDecl>(VD->getDeclContext()) << "::" << *VD;
+      return;
+    }
+    Out << "0";
+    return;
+  case APValue::AddrLabelDiff:
+    Out << "&&" << getAddrLabelDiffLHS()->getLabel()->getName();
+    Out << " - ";
+    Out << "&&" << getAddrLabelDiffRHS()->getLabel()->getName();
+    return;
+  }
+  llvm_unreachable("Unknown APValue kind!");
+}
+
+std::string APValue::getAsString(const ASTContext &Ctx, QualType Ty) const {
+  std::string Result;
+  llvm::raw_string_ostream Out(Result);
+  printPretty(Out, Ctx, Ty);
+  Out.flush();
+  return Result;
+}
+
+bool APValue::toIntegralConstant(APSInt &Result, QualType SrcTy,
+                                 const ASTContext &Ctx) const {
+  if (isInt()) {
+    Result = getInt();
+    return true;
+  }
+
+  if (isLValue() && isNullPointer()) {
+    Result = Ctx.MakeIntValue(Ctx.getTargetNullPointerValue(SrcTy), SrcTy);
+    return true;
+  }
+
+  if (isLValue() && !getLValueBase()) {
+    Result = Ctx.MakeIntValue(getLValueOffset().getQuantity(), SrcTy);
+    return true;
+  }
+
+  return false;
+}
+
+const APValue::LValueBase APValue::getLValueBase() const {
+  assert(isLValue() && "Invalid accessor");
+  return ((const LV*)(const void*)Data.buffer)->Base;
+}
+
+bool APValue::isLValueOnePastTheEnd() const {
+  assert(isLValue() && "Invalid accessor");
+  return ((const LV*)(const void*)Data.buffer)->IsOnePastTheEnd;
+}
+
+CharUnits &APValue::getLValueOffset() {
+  assert(isLValue() && "Invalid accessor");
+  return ((LV*)(void*)Data.buffer)->Offset;
+}
+
+bool APValue::hasLValuePath() const {
+  assert(isLValue() && "Invalid accessor");
+  return ((const LV*)(const char*)Data.buffer)->hasPath();
+}
+
+ArrayRef<APValue::LValuePathEntry> APValue::getLValuePath() const {
+  assert(isLValue() && hasLValuePath() && "Invalid accessor");
+  const LV &LVal = *((const LV*)(const char*)Data.buffer);
+  return llvm::makeArrayRef(LVal.getPath(), LVal.PathLength);
+}
+
+unsigned APValue::getLValueCallIndex() const {
+  assert(isLValue() && "Invalid accessor");
+  return ((const LV*)(const char*)Data.buffer)->Base.getCallIndex();
+}
+
+unsigned APValue::getLValueVersion() const {
+  assert(isLValue() && "Invalid accessor");
+  return ((const LV*)(const char*)Data.buffer)->Base.getVersion();
+}
+
+bool APValue::isNullPointer() const {
+  assert(isLValue() && "Invalid usage");
+  return ((const LV*)(const char*)Data.buffer)->IsNullPtr;
+}
+
+void APValue::setLValue(LValueBase B, const CharUnits &O, NoLValuePath,
+                        bool IsNullPtr) {
+  assert(isLValue() && "Invalid accessor");
+  LV &LVal = *((LV*)(char*)Data.buffer);
+  LVal.Base = B;
+  LVal.IsOnePastTheEnd = false;
+  LVal.Offset = O;
+  LVal.resizePath((unsigned)-1);
+  LVal.IsNullPtr = IsNullPtr;
+}
+
+void APValue::setLValue(LValueBase B, const CharUnits &O,
+                        ArrayRef<LValuePathEntry> Path, bool IsOnePastTheEnd,
+                        bool IsNullPtr) {
+  assert(isLValue() && "Invalid accessor");
+  LV &LVal = *((LV*)(char*)Data.buffer);
+  LVal.Base = B;
+  LVal.IsOnePastTheEnd = IsOnePastTheEnd;
+  LVal.Offset = O;
+  LVal.resizePath(Path.size());
+  memcpy(LVal.getPath(), Path.data(), Path.size() * sizeof(LValuePathEntry));
+  LVal.IsNullPtr = IsNullPtr;
+}
+
+const ValueDecl *APValue::getMemberPointerDecl() const {
+  assert(isMemberPointer() && "Invalid accessor");
+  const MemberPointerData &MPD =
+      *((const MemberPointerData *)(const char *)Data.buffer);
+  return MPD.MemberAndIsDerivedMember.getPointer();
+}
+
+bool APValue::isMemberPointerToDerivedMember() const {
+  assert(isMemberPointer() && "Invalid accessor");
+  const MemberPointerData &MPD =
+      *((const MemberPointerData *)(const char *)Data.buffer);
+  return MPD.MemberAndIsDerivedMember.getInt();
+}
+
+ArrayRef<const CXXRecordDecl*> APValue::getMemberPointerPath() const {
+  assert(isMemberPointer() && "Invalid accessor");
+  const MemberPointerData &MPD =
+      *((const MemberPointerData *)(const char *)Data.buffer);
+  return llvm::makeArrayRef(MPD.getPath(), MPD.PathLength);
+}
+
+void APValue::MakeLValue() {
+  assert(isAbsent() && "Bad state change");
+  static_assert(sizeof(LV) <= DataSize, "LV too big");
+  new ((void*)(char*)Data.buffer) LV();
+  Kind = LValue;
+}
+
+void APValue::MakeArray(unsigned InitElts, unsigned Size) {
+  assert(isAbsent() && "Bad state change");
+  new ((void*)(char*)Data.buffer) Arr(InitElts, Size);
+  Kind = Array;
+}
+
+void APValue::MakeMemberPointer(const ValueDecl *Member, bool IsDerivedMember,
+                                ArrayRef<const CXXRecordDecl*> Path) {
+  assert(isAbsent() && "Bad state change");
+  MemberPointerData *MPD = new ((void*)(char*)Data.buffer) MemberPointerData;
+  Kind = MemberPointer;
+  MPD->MemberAndIsDerivedMember.setPointer(
+      Member ? cast<ValueDecl>(Member->getCanonicalDecl()) : nullptr);
+  MPD->MemberAndIsDerivedMember.setInt(IsDerivedMember);
+  MPD->resizePath(Path.size());
+  for (unsigned I = 0; I != Path.size(); ++I)
+    MPD->getPath()[I] = Path[I]->getCanonicalDecl();
+}
